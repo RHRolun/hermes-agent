@@ -26,6 +26,7 @@ export default function ProgressScreen({ bootstrap }: ProgressProps) {
   const progress = useStore($progress)
   const mode = useStore($mode)
   const [showLogs, setShowLogs] = useState(false)
+  const [now, setNow] = useState(() => Date.now())
   const logEndRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -33,6 +34,17 @@ export default function ProgressScreen({ bootstrap }: ProgressProps) {
       logEndRef.current.scrollIntoView({ behavior: 'smooth' })
     }
   }, [bootstrap.logs.length, showLogs])
+
+  // Tick once a second while the run is in flight so the active step shows a
+  // live elapsed timer — a long single step (e.g. the dependency download)
+  // reads as working, not frozen. Stops when nothing is running.
+  useEffect(() => {
+    if (bootstrap.status !== 'running') {
+      return
+    }
+    const id = window.setInterval(() => setNow(Date.now()), 1000)
+    return () => window.clearInterval(id)
+  }, [bootstrap.status])
 
   const isUpdate = mode === 'update'
   const title = bootstrap.status === 'completed' ? 'Done' : isUpdate ? 'Updating Hermes' : 'Setting up Hermes Agent'
@@ -44,7 +56,7 @@ export default function ProgressScreen({ bootstrap }: ProgressProps) {
   return (
     <div className="hermes-fade-in flex h-full flex-col">
       {/* Header: brand + title + description, matching the desktop install overlay. */}
-      <div className="flex flex-shrink-0 items-start gap-4 px-6 pt-6 pb-4">
+      <div className="flex shrink-0 items-start gap-4 px-6 pt-6 pb-4">
         <BrandMark className="size-11" />
         <div className="min-w-0">
           <h2 className="text-xl font-semibold tracking-tight">{title}</h2>
@@ -53,8 +65,10 @@ export default function ProgressScreen({ bootstrap }: ProgressProps) {
       </div>
 
       <div className="flex flex-1 overflow-hidden">
-        <div className="flex-1 overflow-y-auto px-6 pb-4">
-          {/* Progress line + bar; the count shimmers while the install runs. */}
+        <div className="flex-1 overflow-y-auto px-6 pt-2 pb-4">
+          {/* Progress line + bar; the count shimmers while the install runs.
+              pt-2 matches the log header's py-2 so the "steps complete" line and
+              the "Live output" header share a baseline. */}
           <div className="mb-4">
             <div className="mb-1 flex items-center justify-between text-xs text-muted-foreground">
               <span className={clsx(bootstrap.status === 'running' && 'shimmer')}>
@@ -77,6 +91,12 @@ export default function ProgressScreen({ bootstrap }: ProgressProps) {
             {bootstrap.stageOrder.map((name) => {
               const rec = bootstrap.stages[name]
               if (!rec) return null
+              const meta =
+                rec.state === 'running' && rec.startedAt != null
+                  ? formatElapsed(now - rec.startedAt)
+                  : rec.durationMs != null && rec.state !== 'failed'
+                    ? formatDuration(rec.durationMs)
+                    : null
               return (
                 <li
                   key={name}
@@ -89,11 +109,7 @@ export default function ProgressScreen({ bootstrap }: ProgressProps) {
                 >
                   {rec.state === 'running' && <Loader className="-ml-2 size-6 shrink-0" />}
                   <span className="flex-1 truncate">{rec.info.title}</span>
-                  {rec.durationMs != null && rec.state !== 'failed' && (
-                    <span className="text-xs tabular-nums text-muted-foreground/70">
-                      {formatDuration(rec.durationMs)}
-                    </span>
-                  )}
+                  {meta && <span className="text-xs tabular-nums text-muted-foreground/70">{meta}</span>}
                   <StateIcon state={rec.state ?? null} />
                 </li>
               )
@@ -168,4 +184,12 @@ function formatDuration(ms: number): string {
   const m = Math.floor(ms / 60000)
   const s = Math.round((ms % 60000) / 1000)
   return `${m}m ${s}s`
+}
+
+// Live elapsed for a running stage: bare seconds under a minute, then m:ss.
+function formatElapsed(ms: number): string {
+  const s = Math.max(0, Math.floor(ms / 1000))
+  if (s < 60) return `${s}s`
+  const m = Math.floor(s / 60)
+  return `${m}:${String(s - m * 60).padStart(2, '0')}`
 }
