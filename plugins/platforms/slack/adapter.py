@@ -2716,7 +2716,11 @@ class SlackAdapter(BasePlatformAdapter):
             if channel_id in self._slack_free_response_channels():
                 pass  # Free-response channel — always process
             elif not self._slack_require_mention():
-                pass  # Mention requirement disabled globally for Slack
+                # In listen-all mode, triage non-mention messages if enabled.
+                # This avoids invoking the full agent on every casual message.
+                if not is_mentioned and self._slack_triage_enabled():
+                    if not await self._triage_should_respond(text):
+                        return
             elif self._slack_strict_mention() and not is_mentioned:
                 return  # Strict mode: ignore until @-mentioned again
             elif not is_mentioned:
@@ -4113,6 +4117,98 @@ class SlackAdapter(BasePlatformAdapter):
         if not text:
             return False
         return any(pattern.search(text) for pattern in self._slack_mention_patterns())
+
+    # ── Triage (dynamic response gating) ──────────────────────────────────
+
+    def _slack_triage_enabled(self) -> bool:
+        """Return whether triage is enabled for non-mention messages.
+
+        When ``require_mention: false`` and ``triage: true``, each unaddressed
+        channel message is sent to a cheap LLM call that returns YES/NO before
+        the full agent is invoked.  Disabled by default.
+        """
+        configured = self.config.extra.get("triage")
+        if configured is not None:
+            if isinstance(configured, str):
+                return configured.lower() in {"true", "1", "yes", "on"}
+            return bool(configured)
+        return os.getenv("SLACK_TRIAGE", "false").lower() in {"true", "1", "yes", "on"}
+
+    async def _triage_should_respond(self, text: str) -> bool:
+        """Quick LLM call: should Hermes respond to this unaddressed message?
+
+        Uses the same OPENAI_API_KEY / OPENAI_BASE_URL that Hermes already has
+        configured.  Falls back to responding (True) on any error so that a
+        misconfigured triage never silences the bot entirely.
+
+        Config knobs (all optional):
+          slack.triage_model   / SLACK_TRIAGE_MODEL   — model for triage calls
+                                                         (default: gpt-4o-mini)
+          slack.triage_prompt  / SLACK_TRIAGE_PROMPT  — override the system prompt
+        """
+        api_key = os.getenv("OPENAI_API_KEY", "")
+        if not api_key:
+            logger.debug("[Slack] Triage skipped: OPENAI_API_KEY not set, defaulting to respond")
+            return True
+
+        base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com").rstrip("/")
+        model = (
+            self.config.extra.get("triage_model")
+            or os.getenv("SLACK_TRIAGE_MODEL", "gpt-4o-mini")
+        )
+        system_prompt = (
+            self.config.extra.get("triage_prompt")
+            or os.getenv("SLACK_TRIAGE_PROMPT")
+            or (
+                "You are a triage filter for an AI assistant in a Slack channel.\n"
+                "Decide if the assistant should contribute to this conversation.\n\n"
+                "Reply YES if:\n"
+                "- Someone is asking a technical or process question\n"
+                "- There is an open decision or missing information the assistant can help with\n"
+                "- Expert input or clarification would clearly add value\n\n"
+                "Reply NO if:\n"
+                "- Users are chatting casually or sharing updates among themselves\n"
+                "- The message is self-contained with no open question\n"
+                "- Responding would be intrusive or add no value\n\n"
+                "Reply with only YES or NO."
+            )
+        )
+
+        try:
+            payload = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": text},
+                ],
+                "max_tokens": 3,
+                "temperature": 0,
+            }
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{base_url}/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=5),
+                ) as resp:
+                    if resp.status != 200:
+                        logger.warning(
+                            "[Slack] Triage API returned %d, defaulting to respond", resp.status
+                        )
+                        return True
+                    data = await resp.json()
+                    answer = data["choices"][0]["message"]["content"].strip().upper()
+                    should_respond = answer.startswith("YES")
+                    logger.debug(
+                        "[Slack] Triage → %s for: %.100s", answer, text
+                    )
+                    return should_respond
+        except Exception as exc:
+            logger.warning("[Slack] Triage failed (%s), defaulting to respond", exc)
+            return True
 
 
 # ──────────────────────────────────────────────────────────────────────────
