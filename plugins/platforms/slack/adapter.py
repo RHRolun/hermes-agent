@@ -1258,12 +1258,41 @@ class SlackAdapter(BasePlatformAdapter):
             triage_base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com").rstrip("/")
             has_api_key = bool(os.getenv("OPENAI_API_KEY"))
             if not require_mention and triage_enabled:
+                triage_prompt_src = (
+                    "config:slack.triage_prompt"
+                    if self.config.extra.get("triage_prompt")
+                    else "env:SLACK_TRIAGE_PROMPT"
+                    if os.getenv("SLACK_TRIAGE_PROMPT")
+                    else "built-in default"
+                )
+                triage_system_prompt = (
+                    self.config.extra.get("triage_prompt")
+                    or os.getenv("SLACK_TRIAGE_PROMPT")
+                    or (
+                        "You are a triage filter for an AI assistant in a Slack channel.\n"
+                        "Decide if the assistant should contribute to this conversation.\n\n"
+                        "Reply YES if:\n"
+                        "- Someone is asking a technical or process question\n"
+                        "- There is an open decision or missing information the assistant can help with\n"
+                        "- Expert input or clarification would clearly add value\n\n"
+                        "Reply NO if:\n"
+                        "- Users are chatting casually or sharing updates among themselves\n"
+                        "- The message is self-contained with no open question\n"
+                        "- Responding would be intrusive or add no value\n\n"
+                        "Reply with only YES or NO."
+                    )
+                )
                 logger.info(
                     "[Slack][Triage] ENABLED — model=%s  endpoint=%s/v1/chat/completions"
-                    "  api_key_set=%s",
+                    "  api_key_set=%s  prompt_source=%s",
                     triage_model,
                     triage_base_url,
                     has_api_key,
+                    triage_prompt_src,
+                )
+                logger.info(
+                    "[Slack][Triage] Active system prompt:\n%s",
+                    triage_system_prompt,
                 )
             elif not require_mention and not triage_enabled:
                 logger.info(
@@ -4226,23 +4255,40 @@ class SlackAdapter(BasePlatformAdapter):
             )
         )
 
+        # triage_explain: true adds a brief reason to the model's answer.
+        # Useful for prompt tuning — costs a few extra tokens per message.
+        # Enable via slack.triage_explain: true or SLACK_TRIAGE_EXPLAIN=true.
+        explain_mode = (
+            self.config.extra.get("triage_explain", False)
+            or os.getenv("SLACK_TRIAGE_EXPLAIN", "false").lower() in {"true", "1", "yes", "on"}
+        )
+        if explain_mode:
+            triage_instruction = (
+                "Reply with YES or NO on the first line,"
+                " then a single sentence explaining why."
+            )
+        else:
+            triage_instruction = "Reply with only YES or NO."
+        full_system_prompt = system_prompt.replace("Reply with only YES or NO.", triage_instruction)
+
         logger.info(
-            "[Slack][Triage] Sending request — model=%s  endpoint=%s/v1/chat/completions"
-            "  message=%.200r",
+            "[Slack][Triage] Sending request — model=%s  explain_mode=%s"
+            "  endpoint=%s/v1/chat/completions  message=%.200r",
             model,
+            explain_mode,
             base_url,
             text,
         )
-        logger.debug("[Slack][Triage] System prompt: %s", system_prompt)
+        logger.debug("[Slack][Triage] System prompt: %s", full_system_prompt)
 
         try:
             payload = {
                 "model": model,
                 "messages": [
-                    {"role": "system", "content": system_prompt},
+                    {"role": "system", "content": full_system_prompt},
                     {"role": "user", "content": text},
                 ],
-                "max_tokens": 3,
+                "max_tokens": 60 if explain_mode else 3,
                 "temperature": 0,
             }
             async with aiohttp.ClientSession() as session:
