@@ -1247,6 +1247,35 @@ class SlackAdapter(BasePlatformAdapter):
                 "[Slack] Socket Mode connected (%d workspace(s))",
                 len(self._team_clients),
             )
+
+            # ── Triage startup summary ─────────────────────────────────────
+            triage_enabled = self._slack_triage_enabled()
+            require_mention = self._slack_require_mention()
+            triage_model = (
+                self.config.extra.get("triage_model")
+                or os.getenv("SLACK_TRIAGE_MODEL", "gpt-4o-mini")
+            )
+            triage_base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com").rstrip("/")
+            has_api_key = bool(os.getenv("OPENAI_API_KEY"))
+            if not require_mention and triage_enabled:
+                logger.info(
+                    "[Slack][Triage] ENABLED — model=%s  endpoint=%s/v1/chat/completions"
+                    "  api_key_set=%s",
+                    triage_model,
+                    triage_base_url,
+                    has_api_key,
+                )
+            elif not require_mention and not triage_enabled:
+                logger.info(
+                    "[Slack][Triage] DISABLED — require_mention=false but triage=false;"
+                    " all channel messages will be forwarded to the agent"
+                )
+            else:
+                logger.info(
+                    "[Slack][Triage] N/A — require_mention=true;"
+                    " only @mentions reach the agent"
+                )
+
             return True
 
         except Exception as e:  # pragma: no cover - defensive logging
@@ -2719,7 +2748,28 @@ class SlackAdapter(BasePlatformAdapter):
                 # In listen-all mode, triage non-mention messages if enabled.
                 # This avoids invoking the full agent on every casual message.
                 if not is_mentioned and self._slack_triage_enabled():
-                    if not await self._triage_should_respond(text):
+                    logger.info(
+                        "[Slack][Triage] Evaluating unaddressed message in channel=%s"
+                        " user=%s text=%.200r",
+                        channel_id,
+                        user_id,
+                        text,
+                    )
+                    triage_result = await self._triage_should_respond(text)
+                    if triage_result:
+                        logger.info(
+                            "[Slack][Triage] RESPOND — forwarding to agent"
+                            " (channel=%s text=%.80r)",
+                            channel_id,
+                            text,
+                        )
+                    else:
+                        logger.info(
+                            "[Slack][Triage] SILENT — dropping message"
+                            " (channel=%s text=%.80r)",
+                            channel_id,
+                            text,
+                        )
                         return
             elif self._slack_strict_mention() and not is_mentioned:
                 return  # Strict mode: ignore until @-mentioned again
@@ -4148,7 +4198,9 @@ class SlackAdapter(BasePlatformAdapter):
         """
         api_key = os.getenv("OPENAI_API_KEY", "")
         if not api_key:
-            logger.debug("[Slack] Triage skipped: OPENAI_API_KEY not set, defaulting to respond")
+            logger.warning(
+                "[Slack][Triage] OPENAI_API_KEY not set — triage skipped, defaulting to RESPOND"
+            )
             return True
 
         base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com").rstrip("/")
@@ -4174,6 +4226,15 @@ class SlackAdapter(BasePlatformAdapter):
             )
         )
 
+        logger.info(
+            "[Slack][Triage] Sending request — model=%s  endpoint=%s/v1/chat/completions"
+            "  message=%.200r",
+            model,
+            base_url,
+            text,
+        )
+        logger.debug("[Slack][Triage] System prompt: %s", system_prompt)
+
         try:
             payload = {
                 "model": model,
@@ -4194,20 +4255,36 @@ class SlackAdapter(BasePlatformAdapter):
                     json=payload,
                     timeout=aiohttp.ClientTimeout(total=5),
                 ) as resp:
+                    raw_body = await resp.text()
+                    logger.debug(
+                        "[Slack][Triage] Raw API response (status=%d): %s",
+                        resp.status,
+                        raw_body[:500],
+                    )
                     if resp.status != 200:
                         logger.warning(
-                            "[Slack] Triage API returned %d, defaulting to respond", resp.status
+                            "[Slack][Triage] API error status=%d body=%.300s"
+                            " — defaulting to RESPOND",
+                            resp.status,
+                            raw_body,
                         )
                         return True
-                    data = await resp.json()
+                    data = json.loads(raw_body)
                     answer = data["choices"][0]["message"]["content"].strip().upper()
                     should_respond = answer.startswith("YES")
-                    logger.debug(
-                        "[Slack] Triage → %s for: %.100s", answer, text
+                    logger.info(
+                        "[Slack][Triage] Model=%s  decision=%s  raw_answer=%r"
+                        "  message=%.120r",
+                        model,
+                        "RESPOND" if should_respond else "SILENT",
+                        answer,
+                        text,
                     )
                     return should_respond
         except Exception as exc:
-            logger.warning("[Slack] Triage failed (%s), defaulting to respond", exc)
+            logger.warning(
+                "[Slack][Triage] Request failed (%s) — defaulting to RESPOND", exc, exc_info=True
+            )
             return True
 
 
