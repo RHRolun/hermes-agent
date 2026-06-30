@@ -4316,16 +4316,27 @@ class SlackAdapter(BasePlatformAdapter):
                         )
                         return True
                     data = json.loads(raw_body)
-                    answer = data["choices"][0]["message"]["content"].strip().upper()
-                    should_respond = answer.startswith("YES")
-                    logger.info(
-                        "[Slack][Triage] Model=%s  decision=%s  raw_answer=%r"
-                        "  message=%.120r",
-                        model,
-                        "RESPOND" if should_respond else "SILENT",
-                        answer,
-                        text,
-                    )
+                    full_answer = data["choices"][0]["message"]["content"].strip()
+                    first_line = full_answer.splitlines()[0].strip().upper()
+                    should_respond = first_line.startswith("YES")
+                    if explain_mode:
+                        logger.info(
+                            "[Slack][Triage] Model=%s  decision=%s  reasoning=%r"
+                            "  message=%.120r",
+                            model,
+                            "RESPOND" if should_respond else "SILENT",
+                            full_answer,
+                            text,
+                        )
+                    else:
+                        logger.info(
+                            "[Slack][Triage] Model=%s  decision=%s  raw_answer=%r"
+                            "  message=%.120r",
+                            model,
+                            "RESPOND" if should_respond else "SILENT",
+                            first_line,
+                            text,
+                        )
                     return should_respond
         except Exception as exc:
             logger.warning(
