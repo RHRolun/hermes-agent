@@ -1269,16 +1269,22 @@ class SlackAdapter(BasePlatformAdapter):
                     self.config.extra.get("triage_prompt")
                     or os.getenv("SLACK_TRIAGE_PROMPT")
                     or (
-                        "You are a triage filter for an AI assistant in a Slack channel.\n"
-                        "Decide if the assistant should contribute to this conversation.\n\n"
+                        "You are deciding whether an AI assistant should join a Slack conversation.\n\n"
+                        "You have been given the assistant's identity (what it knows and can do),"
+                        " relevant memories from past interactions, and the recent conversation history."
+                        " Use all of this to make the same call a thoughtful, socially aware colleague would make.\n\n"
                         "Reply YES if:\n"
-                        "- Someone is asking a technical or process question\n"
-                        "- There is an open decision or missing information the assistant can help with\n"
-                        "- Expert input or clarification would clearly add value\n\n"
+                        "- Someone is asking something the assistant — given its identity and knowledge — can genuinely help with\n"
+                        "- The assistant has relevant context from its memories that would add real value here\n"
+                        "- Someone has directly addressed or asked for the assistant\n"
+                        "- The conversation has reached a natural opening where a knowledgeable colleague would speak up\n\n"
                         "Reply NO if:\n"
-                        "- Users are chatting casually or sharing updates among themselves\n"
-                        "- The message is self-contained with no open question\n"
-                        "- Responding would be intrusive or add no value\n\n"
+                        "- The conversation is social, casual, or self-contained — people catching up, sharing updates, reacting to news\n"
+                        "- The question is clearly directed at a specific human, or already answered in the thread\n"
+                        "- Jumping in would feel like an interruption, an intrusion, or an assistant trying too hard to be helpful\n"
+                        "- The message is short social acknowledgment — \"thanks\", \"sounds good\", \"lol\", \"+1\"\n\n"
+                        "Think of it this way: would a knowledgeable colleague with the assistant's background quietly stay out of"
+                        " this, or would they naturally speak up? If they would stay out — stay out.\n\n"
                         "Reply with only YES or NO."
                     )
                 )
@@ -2784,7 +2790,14 @@ class SlackAdapter(BasePlatformAdapter):
                         user_id,
                         text,
                     )
-                    triage_result = await self._triage_should_respond(text)
+                    triage_result = await self._triage_should_respond(
+                        text,
+                        channel_id=channel_id,
+                        thread_ts=event_thread_ts,
+                        ts=ts,
+                        user_id=user_id,
+                        team_id=team_id,
+                    )
                     if triage_result:
                         logger.info(
                             "[Slack][Triage] RESPOND — forwarding to agent"
@@ -4213,7 +4226,16 @@ class SlackAdapter(BasePlatformAdapter):
             return bool(configured)
         return os.getenv("SLACK_TRIAGE", "false").lower() in {"true", "1", "yes", "on"}
 
-    async def _triage_should_respond(self, text: str) -> bool:
+    async def _triage_should_respond(
+        self,
+        text: str,
+        *,
+        channel_id: str = "",
+        thread_ts: Optional[str] = None,
+        ts: str = "",
+        user_id: str = "",
+        team_id: str = "",
+    ) -> bool:
         """Quick LLM call: should Hermes respond to this unaddressed message?
 
         Uses the same OPENAI_API_KEY / OPENAI_BASE_URL that Hermes already has
@@ -4221,9 +4243,10 @@ class SlackAdapter(BasePlatformAdapter):
         misconfigured triage never silences the bot entirely.
 
         Config knobs (all optional):
-          slack.triage_model   / SLACK_TRIAGE_MODEL   — model for triage calls
-                                                         (default: gpt-4o-mini)
-          slack.triage_prompt  / SLACK_TRIAGE_PROMPT  — override the system prompt
+          slack.triage_model          / SLACK_TRIAGE_MODEL   — model for triage calls
+                                                               (default: gpt-4o-mini)
+          slack.triage_prompt         / SLACK_TRIAGE_PROMPT  — override the system prompt
+          slack.triage_context_limit                         — recent messages to fetch (default: 10)
         """
         api_key = os.getenv("OPENAI_API_KEY", "")
         if not api_key:
@@ -4241,16 +4264,22 @@ class SlackAdapter(BasePlatformAdapter):
             self.config.extra.get("triage_prompt")
             or os.getenv("SLACK_TRIAGE_PROMPT")
             or (
-                "You are a triage filter for an AI assistant in a Slack channel.\n"
-                "Decide if the assistant should contribute to this conversation.\n\n"
+                "You are deciding whether an AI assistant should join a Slack conversation.\n\n"
+                "You have been given the assistant's identity (what it knows and can do),"
+                " relevant memories from past interactions, and the recent conversation history."
+                " Use all of this to make the same call a thoughtful, socially aware colleague would make.\n\n"
                 "Reply YES if:\n"
-                "- Someone is asking a technical or process question\n"
-                "- There is an open decision or missing information the assistant can help with\n"
-                "- Expert input or clarification would clearly add value\n\n"
+                "- Someone is asking something the assistant — given its identity and knowledge — can genuinely help with\n"
+                "- The assistant has relevant context from its memories that would add real value here\n"
+                "- Someone has directly addressed or asked for the assistant\n"
+                "- The conversation has reached a natural opening where a knowledgeable colleague would speak up\n\n"
                 "Reply NO if:\n"
-                "- Users are chatting casually or sharing updates among themselves\n"
-                "- The message is self-contained with no open question\n"
-                "- Responding would be intrusive or add no value\n\n"
+                "- The conversation is social, casual, or self-contained — people catching up, sharing updates, reacting to news\n"
+                "- The question is clearly directed at a specific human, or already answered in the thread\n"
+                "- Jumping in would feel like an interruption, an intrusion, or an assistant trying too hard to be helpful\n"
+                "- The message is short social acknowledgment — \"thanks\", \"sounds good\", \"lol\", \"+1\"\n\n"
+                "Think of it this way: would a knowledgeable colleague with the assistant's background quietly stay out of"
+                " this, or would they naturally speak up? If they would stay out — stay out.\n\n"
                 "Reply with only YES or NO."
             )
         )
@@ -4271,22 +4300,173 @@ class SlackAdapter(BasePlatformAdapter):
             triage_instruction = "Reply with only YES or NO."
         full_system_prompt = system_prompt.replace("Reply with only YES or NO.", triage_instruction)
 
+        # ── Context assembly (SOUL + mem0 memories + recent Slack messages) ──
+        context_limit = int(self.config.extra.get("triage_context_limit", 10))
+
+        # 1. SOUL — identity file that defines who Hermes is
+        soul_content: Optional[str] = None
+        try:
+            from agent.prompt_builder import load_soul_md
+            soul_content = load_soul_md()
+        except Exception as _soul_exc:
+            logger.debug("[Slack][Triage] SOUL load skipped: %s", _soul_exc)
+
+        # 2. mem0 memories — personal (sender) + team
+        memories_lines: list[str] = []
+        mem0_url = os.getenv("MEM0_URL", "").rstrip("/")
+        user_display_name = ""
+        if mem0_url and user_id and channel_id:
+            try:
+                user_display_name = await self._resolve_user_name(
+                    user_id, chat_id=channel_id
+                )
+                agent_name = os.getenv("MEM0_AGENT_ID", "hermes")
+                actor_key = "|".join(sorted([user_display_name, agent_name]))
+                async with aiohttp.ClientSession() as _mem_session:
+                    # Team memories
+                    try:
+                        _resp = await _mem_session.post(
+                            f"{mem0_url}/search",
+                            json={
+                                "query": text,
+                                "filters": {"agent_id": "__team__"},
+                                "top_k": 5,
+                            },
+                            timeout=aiohttp.ClientTimeout(total=2),
+                        )
+                        if _resp.status == 200:
+                            _data = await _resp.json()
+                            _results = _data if isinstance(_data, list) else _data.get("results", [])
+                            for _m in _results[:5]:
+                                _mem = (_m.get("memory") or "").strip()
+                                if _mem:
+                                    memories_lines.append(f"[team] {_mem}")
+                    except Exception as _e:
+                        logger.debug("[Slack][Triage] mem0 team search failed: %s", _e)
+                    # Personal memories for the sender
+                    try:
+                        _resp = await _mem_session.post(
+                            f"{mem0_url}/search",
+                            json={
+                                "query": text,
+                                "filters": {
+                                    "user_id": user_display_name,
+                                    "agent_id": actor_key,
+                                },
+                                "top_k": 5,
+                            },
+                            timeout=aiohttp.ClientTimeout(total=2),
+                        )
+                        if _resp.status == 200:
+                            _data = await _resp.json()
+                            _results = _data if isinstance(_data, list) else _data.get("results", [])
+                            for _m in _results[:5]:
+                                _mem = (_m.get("memory") or "").strip()
+                                if _mem:
+                                    memories_lines.append(
+                                        f"[personal:{user_display_name}] {_mem}"
+                                    )
+                    except Exception as _e:
+                        logger.debug("[Slack][Triage] mem0 personal search failed: %s", _e)
+            except Exception as _mem_exc:
+                logger.debug("[Slack][Triage] mem0 context skipped: %s", _mem_exc)
+
+        # 3. Recent Slack messages — thread if available, otherwise channel history
+        slack_context = ""
+        if channel_id:
+            try:
+                if thread_ts:
+                    slack_context = await self._fetch_thread_context(
+                        channel_id=channel_id,
+                        thread_ts=thread_ts,
+                        current_ts=ts,
+                        team_id=team_id,
+                        limit=context_limit,
+                    )
+                else:
+                    _client = self._get_client(channel_id)
+                    _bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
+                    _hist_kwargs: Dict[str, Any] = {
+                        "channel": channel_id,
+                        "limit": context_limit + 1,
+                    }
+                    if ts:
+                        _hist_kwargs["latest"] = ts
+                        _hist_kwargs["inclusive"] = False
+                    _hist = await _client.conversations_history(**_hist_kwargs)
+                    _msgs = list(reversed(_hist.get("messages", [])[:context_limit]))
+                    _parts: list[str] = []
+                    for _msg in _msgs:
+                        if _msg.get("ts") == ts:
+                            continue
+                        if _msg.get("subtype") in {"message_changed", "message_deleted"}:
+                            continue
+                        _msg_text = (_msg.get("text") or "").strip()
+                        if not _msg_text:
+                            continue
+                        if _bot_uid:
+                            _msg_text = _msg_text.replace(f"<@{_bot_uid}>", "").strip()
+                        _msg_user = _msg.get("user", "")
+                        _name = (
+                            await self._resolve_user_name(_msg_user, chat_id=channel_id)
+                            if _msg_user
+                            else "unknown"
+                        )
+                        _parts.append(f"{_name}: {_msg_text}")
+                    if _parts:
+                        slack_context = (
+                            "[Recent channel messages:]\n"
+                            + "\n".join(_parts)
+                            + "\n[End of channel context]"
+                        )
+            except Exception as _ctx_exc:
+                logger.debug("[Slack][Triage] Slack context fetch failed: %s", _ctx_exc)
+
+        # ── Assemble final system and user content ──────────────────────────
+        # System message: only the YES/NO decision instructions.
+        # SOUL goes in the user message as reference data so the triage model
+        # reads it to understand what the assistant does, not to become it.
+        triage_system = full_system_prompt
+
+        user_parts: list[str] = []
+        if soul_content:
+            user_parts.append(
+                "[The assistant's identity and capabilities — use this to judge"
+                " whether it thinks a response would add value, do not adopt this identity:]"
+                "\n" + soul_content
+            )
+        if memories_lines:
+            user_parts.append(
+                "Relevant memories:\n"
+                + "\n".join(f"- {line}" for line in memories_lines)
+            )
+        if slack_context:
+            user_parts.append(slack_context)
+        sender_label = user_display_name or user_id or "user"
+        user_parts.append(f"[Current message from {sender_label}]:\n{text}")
+        triage_user_content = "\n\n".join(user_parts)
+
         logger.info(
             "[Slack][Triage] Sending request — model=%s  explain_mode=%s"
-            "  endpoint=%s/v1/chat/completions  message=%.200r",
+            "  endpoint=%s/v1/chat/completions  message=%.200r"
+            "  soul=%s  memories=%d  context_lines=%d",
             model,
             explain_mode,
             base_url,
             text,
+            soul_content is not None,
+            len(memories_lines),
+            slack_context.count("\n") if slack_context else 0,
         )
-        logger.debug("[Slack][Triage] System prompt: %s", full_system_prompt)
+        logger.debug("[Slack][Triage] System prompt: %s", triage_system)
+        logger.debug("[Slack][Triage] User content: %s", triage_user_content)
 
         try:
             payload = {
                 "model": model,
                 "messages": [
-                    {"role": "system", "content": full_system_prompt},
-                    {"role": "user", "content": text},
+                    {"role": "system", "content": triage_system},
+                    {"role": "user", "content": triage_user_content},
                 ],
                 "max_tokens": 60 if explain_mode else 3,
                 "temperature": 0,
