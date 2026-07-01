@@ -4291,6 +4291,16 @@ class SlackAdapter(BasePlatformAdapter):
                 "max_tokens": 60 if explain_mode else 3,
                 "temperature": 0,
             }
+            # Disable thinking/reasoning mode for triage calls by default.
+            # Thinking models (e.g. Qwen3) return content=null when reasoning
+            # is active and put output in reasoning_content instead, which
+            # breaks the YES/NO extraction.  The option triage_enable_thinking
+            # (default false) lets operators opt back in if needed.
+            enable_thinking = self.config.extra.get("triage_enable_thinking", False)
+            if isinstance(enable_thinking, str):
+                enable_thinking = enable_thinking.lower() in {"true", "1", "yes", "on"}
+            if not enable_thinking:
+                payload["chat_template_kwargs"] = {"enable_thinking": False}
             async with aiohttp.ClientSession() as session:
                 async with session.post(
                     f"{base_url}/v1/chat/completions",
@@ -4316,7 +4326,23 @@ class SlackAdapter(BasePlatformAdapter):
                         )
                         return True
                     data = json.loads(raw_body)
-                    full_answer = data["choices"][0]["message"]["content"].strip()
+                    msg = data["choices"][0]["message"]
+                    content = msg.get("content")
+                    if content is None:
+                        # Thinking models may put output in reasoning_content
+                        # when content is null (e.g. Qwen3 with thinking on).
+                        content = msg.get("reasoning_content") or ""
+                        if content:
+                            logger.debug(
+                                "[Slack][Triage] content was null, fell back to reasoning_content"
+                            )
+                    if not content:
+                        logger.warning(
+                            "[Slack][Triage] Model returned null/empty content"
+                            " — defaulting to RESPOND"
+                        )
+                        return True
+                    full_answer = content.strip()
                     first_line = full_answer.splitlines()[0].strip().upper()
                     should_respond = first_line.startswith("YES")
                     if explain_mode:
