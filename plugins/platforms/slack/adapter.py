@@ -4609,7 +4609,12 @@ def _apply_yaml_config(yaml_cfg: dict, slack_cfg: dict) -> dict | None:
         if isinstance(ac, list):
             ac = ",".join(str(v) for v in ac)
         os.environ["SLACK_ALLOWED_CHANNELS"] = str(ac)
-    return None  # all settings flow through env; nothing to merge into extras
+    # Seed slack.extra into PlatformConfig.extra so the adapter can read
+    # arbitrary per-deployment config (e.g. triage_prompt, triage_model) via
+    # self.config.extra.get(...) without needing a dedicated env var for each.
+    # The returned dict is .update()'d into extra by load_gateway_config().
+    extra_cfg = slack_cfg.get("extra")
+    return dict(extra_cfg) if isinstance(extra_cfg, dict) and extra_cfg else None
 
 
 def _is_connected(config) -> bool:
