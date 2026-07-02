@@ -1269,22 +1269,12 @@ class SlackAdapter(BasePlatformAdapter):
                     self.config.extra.get("triage_prompt")
                     or os.getenv("SLACK_TRIAGE_PROMPT")
                     or (
-                        "You are deciding whether an AI assistant should join a Slack conversation.\n\n"
-                        "You have been given the assistant's identity (what it knows and can do),"
-                        " relevant memories from past interactions, and the recent conversation history."
-                        " Use all of this to make the same call a thoughtful, socially aware colleague would make.\n\n"
-                        "Reply YES if:\n"
-                        "- Someone is asking something the assistant — given its identity and knowledge — can genuinely help with\n"
-                        "- The assistant has relevant context from its memories that would add real value here\n"
-                        "- Someone has directly addressed or asked for the assistant\n"
-                        "- The conversation has reached a natural opening where a knowledgeable colleague would speak up\n\n"
-                        "Reply NO if:\n"
-                        "- The conversation is social, casual, or self-contained — people catching up, sharing updates, reacting to news\n"
-                        "- The question is clearly directed at a specific human, or already answered in the thread\n"
-                        "- Jumping in would feel like an interruption, an intrusion, or an assistant trying too hard to be helpful\n"
-                        "- The message is short social acknowledgment — \"thanks\", \"sounds good\", \"lol\", \"+1\"\n\n"
-                        "Think of it this way: would a knowledgeable colleague with the assistant's background quietly stay out of"
-                        " this, or would they naturally speak up? If they would stay out — stay out.\n\n"
+                        "You are deciding whether you (see your identity in the Soul section) should reply"
+                        " to the latest message in this Slack conversation (see the Slack history for context).\n\n"
+                        "Say YES if you would naturally speak up — someone is talking to you, asking something"
+                        " you can help with, or the moment genuinely calls for your voice (technically or socially).\n"
+                        "Say NO if staying quiet is the more natural move — the conversation is between others,"
+                        " already resolved, or jumping in would feel forced.\n\n"
                         "Reply with only YES or NO."
                     )
                 )
@@ -3652,6 +3642,7 @@ class SlackAdapter(BasePlatformAdapter):
         current_ts: str,
         team_id: str = "",
         limit: int = 30,
+        include_self_replies: bool = False,
     ) -> str:
         """Fetch recent thread messages to provide context when the bot is
         mentioned mid-thread for the first time.
@@ -3739,9 +3730,12 @@ class SlackAdapter(BasePlatformAdapter):
                 #   - the thread parent even if it was posted by a bot
                 #     (e.g. a cron job summary we are now replying to);
                 #   - other bots' child messages (useful third-party context).
+                # When include_self_replies=True (triage path), own replies are
+                # kept so the triage model can follow the conversational thread.
                 if (
                     is_bot
                     and not is_parent
+                    and not include_self_replies
                     and self_bot_uid
                     and msg_user == self_bot_uid
                 ):
@@ -4382,6 +4376,7 @@ class SlackAdapter(BasePlatformAdapter):
                         current_ts=ts,
                         team_id=team_id,
                         limit=context_limit,
+                        include_self_replies=True,
                     )
                 else:
                     _client = self._get_client(channel_id)
