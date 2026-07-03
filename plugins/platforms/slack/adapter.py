@@ -4442,8 +4442,12 @@ class SlackAdapter(BasePlatformAdapter):
         # model sees readable names instead of opaque <@UXXXXX> strings.
         _bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id) if team_id else self._bot_user_id
         display_text = text
-        if _bot_uid:
-            display_text = display_text.replace(f"<@{_bot_uid}>", "[you]")
+        for _uid in set(re.findall(r"<@([A-Z0-9]+)>", display_text)):
+            try:
+                _name = await self._resolve_user_name(_uid, chat_id=channel_id or "")
+            except Exception:
+                _name = _uid
+            display_text = display_text.replace(f"<@{_uid}>", f"@{_name}")
         user_parts.append(f"[Current message from {sender_label}]:\n{display_text}")
         triage_user_content = "\n\n".join(user_parts)
 
