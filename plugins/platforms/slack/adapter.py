@@ -4438,7 +4438,13 @@ class SlackAdapter(BasePlatformAdapter):
         if slack_context:
             user_parts.append(slack_context)
         sender_label = user_display_name or user_id or "user"
-        user_parts.append(f"[Current message from {sender_label}]:\n{text}")
+        # Replace raw Slack mention tokens in the current message so the triage
+        # model sees readable names instead of opaque <@UXXXXX> strings.
+        _bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id) if team_id else self._bot_user_id
+        display_text = text
+        if _bot_uid:
+            display_text = display_text.replace(f"<@{_bot_uid}>", "[you]")
+        user_parts.append(f"[Current message from {sender_label}]:\n{display_text}")
         triage_user_content = "\n\n".join(user_parts)
 
         logger.info(
