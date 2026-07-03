@@ -4399,8 +4399,12 @@ class SlackAdapter(BasePlatformAdapter):
                         _msg_text = (_msg.get("text") or "").strip()
                         if not _msg_text:
                             continue
-                        if _bot_uid:
-                            _msg_text = _msg_text.replace(f"<@{_bot_uid}>", "").strip()
+                        for _mid in set(re.findall(r"<@([A-Z0-9]+)>", _msg_text)):
+                            try:
+                                _mname = await self._resolve_user_name(_mid, chat_id=channel_id)
+                            except Exception:
+                                _mname = _mid
+                            _msg_text = _msg_text.replace(f"<@{_mid}>", f"@{_mname}")
                         _msg_user = _msg.get("user", "")
                         _name = (
                             await self._resolve_user_name(_msg_user, chat_id=channel_id)
