@@ -4245,9 +4245,9 @@ class SlackAdapter(BasePlatformAdapter):
         api_key = os.getenv("OPENAI_API_KEY", "")
         if not api_key:
             logger.warning(
-                "[Slack][Triage] OPENAI_API_KEY not set — triage skipped, defaulting to RESPOND"
+                "[Slack][Triage] OPENAI_API_KEY not set — triage skipped, defaulting to SKIP"
             )
-            return True
+            return False
 
         base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com").rstrip("/")
         model = (
@@ -4453,8 +4453,15 @@ class SlackAdapter(BasePlatformAdapter):
             len(memories_lines),
             slack_context.count("\n") if slack_context else 0,
         )
-        logger.debug("[Slack][Triage] System prompt: %s", triage_system)
-        logger.debug("[Slack][Triage] User content: %s", triage_user_content)
+        triage_debug = self.config.extra.get("triage_debug", False)
+        if isinstance(triage_debug, str):
+            triage_debug = triage_debug.lower() in {"true", "1", "yes", "on"}
+        if triage_debug:
+            logger.info("[Slack][Triage][DEBUG] System prompt:\n%s", triage_system)
+            logger.info("[Slack][Triage][DEBUG] User content:\n%s", triage_user_content)
+        else:
+            logger.debug("[Slack][Triage] System prompt: %s", triage_system)
+            logger.debug("[Slack][Triage] User content: %s", triage_user_content)
 
         try:
             payload = {
@@ -4490,40 +4497,50 @@ class SlackAdapter(BasePlatformAdapter):
                         "Content-Type": "application/json",
                     },
                     json=payload,
-                    timeout=aiohttp.ClientTimeout(total=5),
+                    timeout=aiohttp.ClientTimeout(total=float(self.config.extra.get("triage_timeout", 30))),
                 ) as resp:
                     raw_body = await resp.text()
-                    logger.debug(
-                        "[Slack][Triage] Raw API response (status=%d): %s",
-                        resp.status,
-                        raw_body[:500],
-                    )
-                    if resp.status != 200:
-                        logger.warning(
-                            "[Slack][Triage] API error status=%d body=%.300s"
-                            " — defaulting to RESPOND",
+                    if triage_debug:
+                        logger.info(
+                            "[Slack][Triage][DEBUG] Raw API response (status=%d):\n%s",
                             resp.status,
                             raw_body,
                         )
-                        return True
+                    else:
+                        logger.debug(
+                            "[Slack][Triage] Raw API response (status=%d): %s",
+                            resp.status,
+                            raw_body[:500],
+                        )
+                    if resp.status != 200:
+                        logger.warning(
+                            "[Slack][Triage] API error status=%d body=%.300s"
+                            " — defaulting to SKIP",
+                            resp.status,
+                            raw_body,
+                        )
+                        return False
                     data = json.loads(raw_body)
                     msg = data["choices"][0]["message"]
                     content = msg.get("content")
                     if content is None:
                         # Thinking models may put output in reasoning_content
                         # when content is null (e.g. Qwen3 with thinking on).
-                        content = msg.get("reasoning_content") or ""
-                        if content:
-                            logger.debug(
-                                "[Slack][Triage] content was null, fell back to reasoning_content"
+                        reasoning = msg.get("reasoning_content") or ""
+                        if reasoning:
+                            _log = logger.info if triage_debug else logger.debug
+                            _log(
+                                "[Slack][Triage] content was null, fell back to reasoning_content:\n%s",
+                                reasoning,
                             )
+                        content = reasoning
                     if not content:
                         logger.warning(
                             "[Slack][Triage] Model returned null/empty content"
-                            " — defaulting to RESPOND | raw=%s",
+                            " — defaulting to SKIP | raw=%s",
                             raw_body[:500],
                         )
-                        return True
+                        return False
                     full_answer = content.strip()
                     first_line = full_answer.splitlines()[0].strip().upper()
                     should_respond = first_line.startswith("YES")
@@ -4548,9 +4565,9 @@ class SlackAdapter(BasePlatformAdapter):
                     return should_respond
         except Exception as exc:
             logger.warning(
-                "[Slack][Triage] Request failed (%s) — defaulting to RESPOND", exc, exc_info=True
+                "[Slack][Triage] Request failed (%s) — defaulting to SKIP", exc, exc_info=True
             )
-            return True
+            return False
 
 
 # ──────────────────────────────────────────────────────────────────────────
