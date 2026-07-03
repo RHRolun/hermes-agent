@@ -4474,7 +4474,13 @@ class SlackAdapter(BasePlatformAdapter):
             enable_thinking = self.config.extra.get("triage_enable_thinking", False)
             if isinstance(enable_thinking, str):
                 enable_thinking = enable_thinking.lower() in {"true", "1", "yes", "on"}
-            if not enable_thinking:
+            # chat_template_kwargs is a vLLM-specific parameter. Non-vLLM endpoints
+            # (e.g. LiteLLM proxies like MAAS) may reject or mishandle it, causing
+            # content=null. Only send it when triage_vllm_thinking_control=true.
+            vllm_thinking_control = self.config.extra.get("triage_vllm_thinking_control", False)
+            if isinstance(vllm_thinking_control, str):
+                vllm_thinking_control = vllm_thinking_control.lower() in {"true", "1", "yes", "on"}
+            if not enable_thinking and vllm_thinking_control:
                 payload["chat_template_kwargs"] = {"enable_thinking": False}
             async with aiohttp.ClientSession() as session:
                 async with session.post(
