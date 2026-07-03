@@ -4463,7 +4463,7 @@ class SlackAdapter(BasePlatformAdapter):
                     {"role": "system", "content": triage_system},
                     {"role": "user", "content": triage_user_content},
                 ],
-                "max_tokens": 60 if explain_mode else 3,
+                "max_tokens": int(self.config.extra.get("triage_max_tokens", 1564)),
                 "temperature": 0,
             }
             # Disable thinking/reasoning mode for triage calls by default.
@@ -4520,7 +4520,8 @@ class SlackAdapter(BasePlatformAdapter):
                     if not content:
                         logger.warning(
                             "[Slack][Triage] Model returned null/empty content"
-                            " — defaulting to RESPOND"
+                            " — defaulting to RESPOND | raw=%s",
+                            raw_body[:500],
                         )
                         return True
                     full_answer = content.strip()
