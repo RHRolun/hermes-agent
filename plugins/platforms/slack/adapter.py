@@ -2878,8 +2878,8 @@ class SlackAdapter(BasePlatformAdapter):
                 _ctx_type = "thread" if is_thread_reply else "channel"
                 logger.info(
                     "[Slack][Context] Injecting %s context into agent turn"
-                    " — channel=%s lines=%d limit=%d",
-                    _ctx_type, channel_id, _ctx_lines, _context_limit,
+                    " — channel=%s lines=%d limit=%d user_msg=%.120r",
+                    _ctx_type, channel_id, _ctx_lines, _context_limit, text,
                 )
                 if _ctx_debug:
                     logger.info("[Slack][Context][DEBUG] Injected context:\n%s", _slack_ctx)
@@ -3692,7 +3692,11 @@ class SlackAdapter(BasePlatformAdapter):
         Returns a formatted string with prior thread history, or empty string
         on failure or if the thread has no prior messages.
         """
-        cache_key = f"{channel_id}:{thread_ts}:{team_id}"
+        # Include current_ts in the cache key so each new message triggers a
+        # fresh fetch. Without this, a cache populated by triage (for the same
+        # thread but an earlier message) would be returned for subsequent
+        # messages, missing anything that arrived after the last fetch.
+        cache_key = f"{channel_id}:{thread_ts}:{team_id}:{current_ts}"
         now = time.monotonic()
         cached = self._thread_context_cache.get(cache_key)
         if cached and (now - cached.fetched_at) < self._THREAD_CACHE_TTL:
@@ -3778,9 +3782,16 @@ class SlackAdapter(BasePlatformAdapter):
                 if not msg_text:
                     continue
 
-                # Strip bot mentions from context messages
-                if bot_uid:
-                    msg_text = msg_text.replace(f"<@{bot_uid}>", "").strip()
+                # Resolve all @mentions to display names so the context is
+                # readable and bare @Hermie mentions are preserved, not dropped.
+                for _uid in set(re.findall(r"<@([A-Z0-9]+)>", msg_text)):
+                    try:
+                        _mname = await self._resolve_user_name(_uid, chat_id=channel_id)
+                    except Exception:
+                        _mname = _uid
+                    msg_text = msg_text.replace(f"<@{_uid}>", f"@{_mname}")
+                if not msg_text:
+                    continue
 
                 prefix = "[thread parent] " if is_parent else ""
                 display_user = msg_user or "unknown"
