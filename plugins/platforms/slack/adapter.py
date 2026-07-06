@@ -2773,12 +2773,13 @@ class SlackAdapter(BasePlatformAdapter):
                 # In listen-all mode, triage non-mention messages if enabled.
                 # This avoids invoking the full agent on every casual message.
                 if not is_mentioned and self._slack_triage_enabled():
+                    _log_text = re.sub(r"<@([A-Z0-9]+)>", r"@\1", text)
                     logger.info(
                         "[Slack][Triage] Evaluating unaddressed message in channel=%s"
                         " user=%s text=%.200r",
                         channel_id,
                         user_id,
-                        text,
+                        _log_text,
                     )
                     triage_result = await self._triage_should_respond(
                         text,
@@ -2793,14 +2794,14 @@ class SlackAdapter(BasePlatformAdapter):
                             "[Slack][Triage] RESPOND — forwarding to agent"
                             " (channel=%s text=%.80r)",
                             channel_id,
-                            text,
+                            _log_text,
                         )
                     else:
                         logger.info(
                             "[Slack][Triage] SILENT — dropping message"
                             " (channel=%s text=%.80r)",
                             channel_id,
-                            text,
+                            _log_text,
                         )
                         return
             elif self._slack_strict_mention() and not is_mentioned:
@@ -2841,21 +2842,55 @@ class SlackAdapter(BasePlatformAdapter):
                     for t in to_remove:
                         self._mentioned_threads.discard(t)
 
-        # When entering a thread for the first time (no existing session),
-        # fetch thread context so the agent understands the conversation.
-        if is_thread_reply and not self._has_active_session_for_thread(
-            channel_id=channel_id,
-            thread_ts=event_thread_ts,
-            user_id=user_id,
-        ):
-            thread_context = await self._fetch_thread_context(
-                channel_id=channel_id,
-                thread_ts=event_thread_ts,
-                current_ts=ts,
-                team_id=team_id,
-            )
-            if thread_context:
-                text = thread_context + text
+        # Always inject recent Slack context so the agent sees messages from
+        # other participants — including gaps between its own turns — rather
+        # than just its own session history.  For thread replies this covers
+        # the full thread; for top-level channel messages it fetches recent
+        # channel history.  Disable via slack.extra.slack_inject_context: false.
+        _inject_context = self.config.extra.get("slack_inject_context", True)
+        if isinstance(_inject_context, str):
+            _inject_context = _inject_context.lower() not in {"false", "0", "no", "off"}
+        _context_limit = int(self.config.extra.get("slack_context_limit", 20))
+        if _inject_context:
+            if is_thread_reply:
+                _slack_ctx = await self._fetch_thread_context(
+                    channel_id=channel_id,
+                    thread_ts=event_thread_ts,
+                    current_ts=ts,
+                    team_id=team_id,
+                    limit=_context_limit,
+                    include_self_replies=True,
+                )
+            elif not is_dm:
+                _slack_ctx = await self._fetch_channel_context(
+                    channel_id=channel_id,
+                    current_ts=ts,
+                    team_id=team_id,
+                    limit=_context_limit,
+                )
+            else:
+                _slack_ctx = ""
+            _ctx_debug = self.config.extra.get("slack_context_debug", False)
+            if isinstance(_ctx_debug, str):
+                _ctx_debug = _ctx_debug.lower() in {"true", "1", "yes", "on"}
+            if _slack_ctx:
+                _ctx_lines = _slack_ctx.count("\n")
+                _ctx_type = "thread" if is_thread_reply else "channel"
+                logger.info(
+                    "[Slack][Context] Injecting %s context into agent turn"
+                    " — channel=%s lines=%d limit=%d",
+                    _ctx_type, channel_id, _ctx_lines, _context_limit,
+                )
+                if _ctx_debug:
+                    logger.info("[Slack][Context][DEBUG] Injected context:\n%s", _slack_ctx)
+                else:
+                    logger.debug("[Slack][Context] Context content:\n%s", _slack_ctx)
+                text = _slack_ctx + text
+            else:
+                logger.debug(
+                    "[Slack][Context] No prior context to inject — channel=%s is_thread=%s",
+                    channel_id, is_thread_reply,
+                )
 
         # Determine message type
         msg_type = MessageType.TEXT
@@ -3644,14 +3679,12 @@ class SlackAdapter(BasePlatformAdapter):
         limit: int = 30,
         include_self_replies: bool = False,
     ) -> str:
-        """Fetch recent thread messages to provide context when the bot is
-        mentioned mid-thread for the first time.
+        """Fetch recent thread messages to give the agent full thread visibility.
 
-        This method is only called when there is NO active session for the
-        thread (guarded at the call site by _has_active_session_for_thread).
-        That guard ensures thread messages are prepended only on the very
-        first turn — after that the session history already holds them, so
-        there is no duplication across subsequent turns.
+        Called on every turn so the agent sees messages from other participants
+        that arrived between its own turns, not just its own session history.
+        When include_self_replies=True the bot's own prior replies are included
+        so the agent can follow the full conversational thread.
 
         Results are cached for _THREAD_CACHE_TTL seconds per thread to avoid
         hammering conversations.replies (Tier 3, ~50 req/min).
@@ -3762,7 +3795,7 @@ class SlackAdapter(BasePlatformAdapter):
             content = ""
             if context_parts:
                 content = (
-                    "[Thread context — prior messages in this thread (not yet in conversation history):]\n"
+                    "[Recent Slack thread context:]\n"
                     + "\n".join(context_parts)
                     + "\n[End of thread context]\n\n"
                 )
@@ -3821,6 +3854,62 @@ class SlackAdapter(BasePlatformAdapter):
             return text
         except Exception as exc:  # pragma: no cover - defensive
             logger.debug("[Slack] Failed to fetch thread parent text: %s", exc)
+            return ""
+
+    async def _fetch_channel_context(
+        self,
+        channel_id: str,
+        current_ts: str,
+        team_id: str = "",
+        limit: int = 20,
+    ) -> str:
+        """Fetch recent channel-level messages to inject as context for the agent.
+
+        Used for top-level (non-thread) channel messages so the agent sees
+        the surrounding conversation even when it wasn't previously involved.
+
+        Returns a formatted string, or empty string on failure / no messages.
+        """
+        try:
+            client = self._get_client(channel_id)
+            bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
+            hist = await client.conversations_history(
+                channel=channel_id,
+                limit=limit + 1,
+                latest=current_ts,
+                inclusive=False,
+            )
+            msgs = list(reversed(hist.get("messages", [])[:limit]))
+            parts: list[str] = []
+            for msg in msgs:
+                if msg.get("subtype") in {"message_changed", "message_deleted"}:
+                    continue
+                msg_text = (msg.get("text") or "").strip()
+                if not msg_text:
+                    continue
+                # Resolve all @mentions to display names
+                for _uid in set(re.findall(r"<@([A-Z0-9]+)>", msg_text)):
+                    try:
+                        _name = await self._resolve_user_name(_uid, chat_id=channel_id)
+                    except Exception:
+                        _name = _uid
+                    msg_text = msg_text.replace(f"<@{_uid}>", f"@{_name}")
+                msg_user = msg.get("user", "")
+                sender = (
+                    await self._resolve_user_name(msg_user, chat_id=channel_id)
+                    if msg_user
+                    else (msg.get("username") or "bot")
+                )
+                parts.append(f"{sender}: {msg_text}")
+            if not parts:
+                return ""
+            return (
+                "[Recent Slack channel context:]\n"
+                + "\n".join(parts)
+                + "\n[End of channel context]\n\n"
+            )
+        except Exception as exc:
+            logger.debug("[Slack] Failed to fetch channel context: %s", exc)
             return ""
 
     async def _handle_slash_command(self, command: dict) -> None:
@@ -4565,7 +4654,7 @@ class SlackAdapter(BasePlatformAdapter):
                             model,
                             "RESPOND" if should_respond else "SILENT",
                             full_answer,
-                            text,
+                            display_text,
                         )
                     else:
                         logger.info(
@@ -4574,7 +4663,7 @@ class SlackAdapter(BasePlatformAdapter):
                             model,
                             "RESPOND" if should_respond else "SILENT",
                             first_line,
-                            text,
+                            display_text,
                         )
                     return should_respond
         except Exception as exc:
