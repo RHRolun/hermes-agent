@@ -2773,37 +2773,59 @@ class SlackAdapter(BasePlatformAdapter):
                 # In listen-all mode, triage non-mention messages if enabled.
                 # This avoids invoking the full agent on every casual message.
                 if not is_mentioned and self._slack_triage_enabled():
-                    _log_text = re.sub(r"<@([A-Z0-9]+)>", r"@\1", text)
-                    logger.info(
-                        "[Slack][Triage] Evaluating unaddressed message in channel=%s"
-                        " user=%s text=%.200r",
-                        channel_id,
-                        user_id,
-                        _log_text,
+                    # Audio/voice messages arrive with empty text — the model
+                    # sees nothing and usually says NO, silencing the bot.
+                    # Treat them like @mentions (bypass triage) so the agent
+                    # always gets a chance to transcribe and respond.
+                    # Controlled by slack.extra.triage_pass_audio (default true).
+                    _has_audio = any(
+                        f.get("mimetype", "").startswith("audio/")
+                        or f.get("subtype") == "slack_audio"
+                        or (f.get("name") or "").startswith("audio_message")
+                        for f in event.get("files", [])
                     )
-                    triage_result = await self._triage_should_respond(
-                        text,
-                        channel_id=channel_id,
-                        thread_ts=event_thread_ts,
-                        ts=ts,
-                        user_id=user_id,
-                        team_id=team_id,
-                    )
-                    if triage_result:
+                    _pass_audio = self.config.extra.get("triage_pass_audio", True)
+                    if isinstance(_pass_audio, str):
+                        _pass_audio = _pass_audio.lower() not in {"false", "0", "no", "off"}
+                    if _has_audio and _pass_audio:
                         logger.info(
-                            "[Slack][Triage] RESPOND — forwarding to agent"
-                            " (channel=%s text=%.80r)",
+                            "[Slack][Triage] Audio message — bypassing triage"
+                            " (channel=%s user=%s)",
                             channel_id,
-                            _log_text,
+                            user_id,
                         )
                     else:
+                        _log_text = re.sub(r"<@([A-Z0-9]+)>", r"@\1", text)
                         logger.info(
-                            "[Slack][Triage] SILENT — dropping message"
-                            " (channel=%s text=%.80r)",
+                            "[Slack][Triage] Evaluating unaddressed message in channel=%s"
+                            " user=%s text=%.200r",
                             channel_id,
+                            user_id,
                             _log_text,
                         )
-                        return
+                        triage_result = await self._triage_should_respond(
+                            text,
+                            channel_id=channel_id,
+                            thread_ts=event_thread_ts,
+                            ts=ts,
+                            user_id=user_id,
+                            team_id=team_id,
+                        )
+                        if triage_result:
+                            logger.info(
+                                "[Slack][Triage] RESPOND — forwarding to agent"
+                                " (channel=%s text=%.80r)",
+                                channel_id,
+                                _log_text,
+                            )
+                        else:
+                            logger.info(
+                                "[Slack][Triage] SILENT — dropping message"
+                                " (channel=%s text=%.80r)",
+                                channel_id,
+                                _log_text,
+                            )
+                            return
             elif self._slack_strict_mention() and not is_mentioned:
                 return  # Strict mode: ignore until @-mentioned again
             elif not is_mentioned:
