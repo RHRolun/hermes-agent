@@ -2827,8 +2827,14 @@ class SlackAdapter(BasePlatformAdapter):
                     return
 
         if is_mentioned:
-            # Strip the bot mention from the text
-            text = text.replace(f"<@{bot_uid}>", "").strip()
+            # Replace bot mention with its display name so "Hey @Hermie," stays
+            # readable rather than leaving behind orphan punctuation like "Hey ,".
+            if bot_uid:
+                try:
+                    _bot_name = await self._resolve_user_name(bot_uid, chat_id=channel_id)
+                except Exception:
+                    _bot_name = ""
+                text = text.replace(f"<@{bot_uid}>", f"@{_bot_name}" if _bot_name else "").strip()
             # Register this thread so all future messages auto-trigger the bot.
             # Skipped in strict mode: strict_mention=true bots must be
             # re-mentioned every turn, so remembering the thread would
@@ -2885,7 +2891,14 @@ class SlackAdapter(BasePlatformAdapter):
                     logger.info("[Slack][Context][DEBUG] Injected context:\n%s", _slack_ctx)
                 else:
                     logger.debug("[Slack][Context] Context content:\n%s", _slack_ctx)
-                text = _slack_ctx + text
+                # Label the current message so the agent knows which one to
+                # respond to, especially important when the context ends with
+                # another @-mention of the bot (e.g. a prior rap request).
+                try:
+                    _sender_name = await self._resolve_user_name(user_id, chat_id=channel_id)
+                except Exception:
+                    _sender_name = user_id
+                text = _slack_ctx + f"[Current message from {_sender_name}:]\n{text}"
             else:
                 logger.debug(
                     "[Slack][Context] No prior context to inject — channel=%s is_thread=%s",
@@ -4391,7 +4404,10 @@ class SlackAdapter(BasePlatformAdapter):
                 " then a single sentence explaining why."
             )
         else:
-            triage_instruction = "Reply with only YES or NO."
+            triage_instruction = (
+                "Your entire response MUST be exactly one word: YES or NO. "
+                "Do not write anything else — no punctuation, no explanation, no preamble."
+            )
         full_system_prompt = system_prompt.replace("Reply with only YES or NO.", triage_instruction)
 
         # ── Context assembly (SOUL + mem0 memories + recent Slack messages) ──
@@ -4603,6 +4619,15 @@ class SlackAdapter(BasePlatformAdapter):
                 vllm_thinking_control = vllm_thinking_control.lower() in {"true", "1", "yes", "on"}
             if not enable_thinking and vllm_thinking_control:
                 payload["chat_template_kwargs"] = {"enable_thinking": False}
+            # guided_choice constrains the model to output exactly one of the
+            # listed strings — the strongest enforcement available on vLLM.
+            # Enable via slack.extra.triage_guided_choice: true.
+            # Do not use in explain_mode (model needs to output more than one word).
+            guided_choice = self.config.extra.get("triage_guided_choice", False)
+            if isinstance(guided_choice, str):
+                guided_choice = guided_choice.lower() in {"true", "1", "yes", "on"}
+            if guided_choice and not explain_mode:
+                payload["guided_choice"] = ["YES", "NO"]
             async with aiohttp.ClientSession() as session:
                 async with session.post(
                     f"{base_url}/v1/chat/completions",
@@ -4656,8 +4681,31 @@ class SlackAdapter(BasePlatformAdapter):
                         )
                         return False
                     full_answer = content.strip()
-                    first_line = full_answer.splitlines()[0].strip().upper()
-                    should_respond = first_line.startswith("YES")
+                    # Strip <think>...</think> blocks that thinking models
+                    # (e.g. gpt-oss-120b) may embed inside content before
+                    # the actual YES/NO answer.
+                    answer_text = re.sub(
+                        r"<think>.*?</think>", "", full_answer,
+                        flags=re.DOTALL | re.IGNORECASE,
+                    ).strip()
+                    # Scan lines top-to-bottom for the first that contains
+                    # YES or NO so verbose answers like "I would say YES"
+                    # still resolve correctly.
+                    should_respond = False
+                    _decision_found = False
+                    for _line in answer_text.splitlines():
+                        _lu = _line.strip().upper()
+                        if not _lu:
+                            continue
+                        if "YES" in _lu:
+                            should_respond = True
+                            _decision_found = True
+                        elif "NO" in _lu:
+                            should_respond = False
+                            _decision_found = True
+                        if _decision_found:
+                            break
+                    first_line = answer_text.splitlines()[0].strip() if answer_text else full_answer.splitlines()[0].strip()
                     if explain_mode:
                         logger.info(
                             "[Slack][Triage] Model=%s  decision=%s  reasoning=%r"
