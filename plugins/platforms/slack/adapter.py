@@ -4428,9 +4428,13 @@ class SlackAdapter(BasePlatformAdapter):
                 _triage_bot_name = ""
             if _triage_bot_name:
                 full_system_prompt = (
-                    f"Your Slack display name is **{_triage_bot_name}**. "
-                    f"If the message @mentions or is clearly directed at a different person or bot "
-                    f"(not {_triage_bot_name}), say NO — that message is not for you.\n\n"
+                    f"Your Slack display name is **{_triage_bot_name}**.\n"
+                    f"- If the message @mentions or is clearly directed at a different person or bot "
+                    f"(not {_triage_bot_name}), say NO — that message is not for you.\n"
+                    f"- If the conversation thread shows another bot is already actively responding "
+                    f"to the same topic, and the new message is a natural follow-up with no explicit "
+                    f"@mention of {_triage_bot_name}, say NO — the follow-up is for that other bot, "
+                    f"not you.\n\n"
                     + full_system_prompt
                 )
 
