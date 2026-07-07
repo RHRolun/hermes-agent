@@ -4410,6 +4410,30 @@ class SlackAdapter(BasePlatformAdapter):
             )
         full_system_prompt = system_prompt.replace("Reply with only YES or NO.", triage_instruction)
 
+        # Prepend the bot's own Slack display name to the system prompt so the
+        # model can recognise when a message is directed at a *different* bot
+        # and correctly say NO.  Without this, two bots in the same channel
+        # both say YES to "@OtherBot do X" because they each think they are
+        # "the assistant" and someone is asking for help.
+        _triage_bot_uid = (
+            self._team_bot_user_ids.get(team_id, self._bot_user_id)
+            if team_id else self._bot_user_id
+        )
+        if _triage_bot_uid:
+            try:
+                _triage_bot_name = await self._resolve_user_name(
+                    _triage_bot_uid, chat_id=channel_id or ""
+                )
+            except Exception:
+                _triage_bot_name = ""
+            if _triage_bot_name:
+                full_system_prompt = (
+                    f"Your Slack display name is **{_triage_bot_name}**. "
+                    f"If the message @mentions or is clearly directed at a different person or bot "
+                    f"(not {_triage_bot_name}), say NO — that message is not for you.\n\n"
+                    + full_system_prompt
+                )
+
         # ── Context assembly (SOUL + mem0 memories + recent Slack messages) ──
         context_limit = int(self.config.extra.get("triage_context_limit", 10))
 
