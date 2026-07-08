@@ -4480,7 +4480,9 @@ class SlackAdapter(BasePlatformAdapter):
                     user_id, chat_id=channel_id
                 )
                 agent_name = os.getenv("MEM0_AGENT_ID", "hermes")
-                actor_key = "|".join(sorted([user_display_name, agent_name]))
+                _mem0_user_id = user_display_name.replace(" ", "_")
+                _mem0_agent_name = agent_name.replace(" ", "_")
+                actor_key = "|".join(sorted([_mem0_user_id, _mem0_agent_name]))
                 async with aiohttp.ClientSession() as _mem_session:
                     # Team memories
                     try:
@@ -4509,7 +4511,7 @@ class SlackAdapter(BasePlatformAdapter):
                             json={
                                 "query": text,
                                 "filters": {
-                                    "user_id": user_display_name,
+                                    "user_id": _mem0_user_id,
                                     "agent_id": actor_key,
                                 },
                                 "top_k": triage_memory_limit,
