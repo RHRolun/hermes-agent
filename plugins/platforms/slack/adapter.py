@@ -2038,7 +2038,6 @@ class SlackAdapter(BasePlatformAdapter):
             return name
         except Exception as e:
             logger.debug("[Slack] users.info failed for %s: %s", user_id, e)
-            self._user_name_cache[user_id] = user_id
             return user_id
 
     async def send_image_file(
