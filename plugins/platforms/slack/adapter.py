@@ -3747,6 +3747,7 @@ class SlackAdapter(BasePlatformAdapter):
                         channel=channel_id,
                         ts=thread_ts,
                         limit=limit + 1,  # +1 because it includes the current message
+                        latest=current_ts,
                         inclusive=True,
                     )
                     break
