@@ -4393,21 +4393,30 @@ class SlackAdapter(BasePlatformAdapter):
             self.config.extra.get("triage_prompt")
             or os.getenv("SLACK_TRIAGE_PROMPT")
             or (
-                "You are deciding whether an AI assistant should join a Slack conversation.\n\n"
-                "You have been given the assistant's identity (what it knows and can do),"
-                " relevant memories from past interactions, and the recent conversation history."
-                " Use all of this to make the same call a thoughtful, socially aware colleague would make.\n\n"
+                "Your Slack display name is **{bot_name}**.\n"
+                "- If the message @mentions or is clearly directed at a different person or bot "
+                "(not {bot_name}), say NO — that message is not for you.\n"
+                "- If the conversation thread shows another bot or person is already actively "
+                "responding to the same topic, and the new message is a natural follow-up with "
+                "no explicit @mention of {bot_name}, say NO — the follow-up is for that other "
+                "participant, not you.\n"
+                "- Imperative language like 'answer the question', 'respond', or 'reply' "
+                "without an explicit @mention of {bot_name} means the command is directed at "
+                "whoever is already active in the conversation, not you. Say NO.\n\n"
+                "You are deciding whether you (see your identity in the Soul section) should "
+                "reply to the latest message in this Slack conversation (see the Slack history "
+                "for context).\n\n"
                 "Reply YES if:\n"
-                "- Someone is asking something the assistant — given its identity and knowledge — can genuinely help with\n"
-                "- The assistant has relevant context from its memories that would add real value here\n"
-                "- Someone has directly addressed or asked for the assistant\n"
+                "- Someone is asking something you — given your identity and knowledge — can genuinely help with\n"
+                "- You have relevant context from your memories that would add real value here\n"
+                "- Someone has directly addressed or asked for you\n"
                 "- The conversation has reached a natural opening where a knowledgeable colleague would speak up\n\n"
                 "Reply NO if:\n"
                 "- The conversation is social, casual, or self-contained — people catching up, sharing updates, reacting to news\n"
                 "- The question is clearly directed at a specific human, or already answered in the thread\n"
                 "- Jumping in would feel like an interruption, an intrusion, or an assistant trying too hard to be helpful\n"
                 "- The message is short social acknowledgment — \"thanks\", \"sounds good\", \"lol\", \"+1\"\n\n"
-                "Think of it this way: would a knowledgeable colleague with the assistant's background quietly stay out of"
+                "Think of it this way: would a knowledgeable colleague with your background quietly stay out of"
                 " this, or would they naturally speak up? If they would stay out — stay out.\n\n"
                 "Reply with only YES or NO."
             )
@@ -4432,33 +4441,22 @@ class SlackAdapter(BasePlatformAdapter):
             )
         full_system_prompt = system_prompt.replace("Reply with only YES or NO.", triage_instruction)
 
-        # Prepend the bot's own Slack display name to the system prompt so the
-        # model can recognise when a message is directed at a *different* bot
-        # and correctly say NO.  Without this, two bots in the same channel
-        # both say YES to "@OtherBot do X" because they each think they are
-        # "the assistant" and someone is asking for help.
+        # Substitute {bot_name} in the prompt with the bot's actual Slack
+        # display name so the model knows who it is and can correctly say NO
+        # when a message is directed at a different bot.
         _triage_bot_uid = (
             self._team_bot_user_ids.get(team_id, self._bot_user_id)
             if team_id else self._bot_user_id
         )
+        _triage_bot_name = ""
         if _triage_bot_uid:
             try:
                 _triage_bot_name = await self._resolve_user_name(
                     _triage_bot_uid, chat_id=channel_id or ""
                 )
             except Exception:
-                _triage_bot_name = ""
-            if _triage_bot_name:
-                full_system_prompt = (
-                    f"Your Slack display name is **{_triage_bot_name}**.\n"
-                    f"- If the message @mentions or is clearly directed at a different person or bot "
-                    f"(not {_triage_bot_name}), say NO — that message is not for you.\n"
-                    f"- If the conversation thread shows another bot is already actively responding "
-                    f"to the same topic, and the new message is a natural follow-up with no explicit "
-                    f"@mention of {_triage_bot_name}, say NO — the follow-up is for that other bot, "
-                    f"not you.\n\n"
-                    + full_system_prompt
-                )
+                pass
+        full_system_prompt = full_system_prompt.replace("{bot_name}", _triage_bot_name or "the assistant")
 
         # ── Context assembly (SOUL + mem0 memories + recent Slack messages) ──
         context_limit = int(self.config.extra.get("triage_context_limit", 10))
@@ -4474,8 +4472,9 @@ class SlackAdapter(BasePlatformAdapter):
         # 2. mem0 memories — personal (sender) + team
         memories_lines: list[str] = []
         mem0_url = os.getenv("MEM0_URL", "").rstrip("/")
+        triage_memory_limit = int(self.config.extra.get("triage_memory_limit", 5))
         user_display_name = ""
-        if mem0_url and user_id and channel_id:
+        if triage_memory_limit > 0 and mem0_url and user_id and channel_id:
             try:
                 user_display_name = await self._resolve_user_name(
                     user_id, chat_id=channel_id
@@ -4490,14 +4489,14 @@ class SlackAdapter(BasePlatformAdapter):
                             json={
                                 "query": text,
                                 "filters": {"agent_id": "__team__"},
-                                "top_k": 5,
+                                "top_k": triage_memory_limit,
                             },
                             timeout=aiohttp.ClientTimeout(total=2),
                         )
                         if _resp.status == 200:
                             _data = await _resp.json()
                             _results = _data if isinstance(_data, list) else _data.get("results", [])
-                            for _m in _results[:5]:
+                            for _m in _results[:triage_memory_limit]:
                                 _mem = (_m.get("memory") or "").strip()
                                 if _mem:
                                     memories_lines.append(f"[team] {_mem}")
@@ -4513,14 +4512,14 @@ class SlackAdapter(BasePlatformAdapter):
                                     "user_id": user_display_name,
                                     "agent_id": actor_key,
                                 },
-                                "top_k": 5,
+                                "top_k": triage_memory_limit,
                             },
                             timeout=aiohttp.ClientTimeout(total=2),
                         )
                         if _resp.status == 200:
                             _data = await _resp.json()
                             _results = _data if isinstance(_data, list) else _data.get("results", [])
-                            for _m in _results[:5]:
+                            for _m in _results[:triage_memory_limit]:
                                 _mem = (_m.get("memory") or "").strip()
                                 if _mem:
                                     memories_lines.append(
