@@ -1988,6 +1988,18 @@ class SlackAdapter(BasePlatformAdapter):
             try:
                 from tools.mcp_oauth import _current_slack_user_id
                 _current_slack_user_id.set(user_id)
+                # Force the MCP SDK to re-call get_tokens() on the next request
+                # so it picks up the per-user token rather than using its cached
+                # service-account token. Setting _initialized = False is the same
+                # operation that invalidate_if_disk_changed performs when it
+                # detects an external token refresh. Without this, the SDK keeps
+                # using the SA token it loaded at pod startup for the entire
+                # lifetime of the process, bypassing the ContextVar-based
+                # per-user token selection in HermesTokenStorage.get_tokens().
+                from tools.mcp_oauth_manager import get_manager
+                for _entry in get_manager()._entries.values():
+                    if _entry.provider is not None and hasattr(_entry.provider, "_initialized"):
+                        _entry.provider._initialized = False
             except Exception:
                 pass
 
