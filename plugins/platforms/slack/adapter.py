@@ -1981,6 +1981,16 @@ class SlackAdapter(BasePlatformAdapter):
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an in-progress reaction when message processing begins."""
+        # Publish the Slack user ID so HermesTokenStorage.get_tokens() can
+        # pick up the per-user MCP token for this turn (see mcp_oauth.py).
+        user_id = getattr(event.source, "user_id", None)
+        if user_id:
+            try:
+                from tools.mcp_oauth import _current_slack_user_id
+                _current_slack_user_id.set(user_id)
+            except Exception:
+                pass
+
         if not self._reactions_enabled():
             return
         ts = getattr(event, "message_id", None)

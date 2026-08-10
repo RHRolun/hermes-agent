@@ -105,6 +105,15 @@ _oauth_interactive_enabled: "contextvars.ContextVar[bool]" = contextvars.Context
 )
 
 
+# Per-turn Slack user ID for per-user MCP token lookup.
+# Set by the Slack adapter's on_processing_start before each turn so that
+# HermesTokenStorage.get_tokens() can prefer a user-specific token file over
+# the shared service-account token.  ContextVar propagates across the
+# asyncio thread boundary (run_coroutine_threadsafe) — same reason as above.
+_current_slack_user_id: "contextvars.ContextVar[str | None]" = contextvars.ContextVar(
+    "_current_slack_user_id", default=None
+)
+
 # Skip tokens accepted at the paste prompt — exit OAuth without auth.
 _SKIP_TOKENS = frozenset({"skip", "cancel", "s", "n", "no", "q", "quit"})
 
@@ -268,8 +277,38 @@ class HermesTokenStorage:
 
     # -- tokens ------------------------------------------------------------
 
+    def _user_tokens_path(self) -> Path | None:
+        """Return the per-user token path if a Slack user ID is set, else None.
+
+        Path: HERMES_HOME/user-tokens/{slack_user_id}/{server_name}.json
+        Written by the auth-ui pod after a successful PKCE flow.
+        """
+        user_id = _current_slack_user_id.get()
+        if not user_id:
+            return None
+        try:
+            from hermes_constants import get_hermes_home
+            base = Path(get_hermes_home())
+        except ImportError:
+            base = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+        return base / "user-tokens" / user_id / f"{self._server_name}.json"
+
     async def get_tokens(self) -> "OAuthToken | None":
-        data = _read_json(self._tokens_path())
+        # Prefer the per-user token when a Slack user is active for this turn.
+        user_path = self._user_tokens_path()
+        if user_path is not None and user_path.exists():
+            data = _read_json(user_path)
+            if data is not None:
+                logger.debug(
+                    "MCP OAuth '%s': using per-user token for slack_user=%s",
+                    self._server_name, _current_slack_user_id.get(),
+                )
+            # Fall through to SA token if the user file is unreadable.
+        else:
+            data = None
+
+        if data is None:
+            data = _read_json(self._tokens_path())
         if data is None:
             return None
         # Hermes records an absolute wall-clock ``expires_at`` alongside the
