@@ -3067,37 +3067,6 @@ def _wrap_with_home_override(coro: "Coroutine") -> "Coroutine":
     return _scoped()
 
 
-def _wrap_with_slack_user_id(coro: "Coroutine") -> "Coroutine":
-    """Carry the caller's _current_slack_user_id into ``coro`` on the MCP loop.
-
-    Tasks scheduled via run_coroutine_threadsafe are created inside the MCP
-    loop thread and copy the loop thread's context — NOT the Slack message
-    handler thread's context. _current_slack_user_id set in on_processing_start
-    therefore vanishes at the thread boundary, so get_tokens() sees no user ID
-    and falls back to the shared SA token.
-
-    This wrapper captures the ContextVar value from the calling (Slack) thread
-    and re-sets it inside the coroutine's own task-local context on the MCP
-    loop, exactly mirroring _wrap_with_home_override. No-op when no user ID is
-    active (background tasks, non-Slack tool calls).
-    """
-    try:
-        from tools.mcp_oauth import _current_slack_user_id
-        user_id = _current_slack_user_id.get()
-    except Exception:
-        return coro
-    if not user_id:
-        return coro
-
-    async def _scoped():
-        token = _current_slack_user_id.set(user_id)
-        try:
-            return await coro
-        finally:
-            _current_slack_user_id.reset(token)
-
-    return _scoped()
-
 
 def _run_on_mcp_loop(coro_or_factory, timeout: float = 30):
     """Schedule a coroutine on the MCP event loop and block until done.
@@ -3133,11 +3102,6 @@ def _run_on_mcp_loop(coro_or_factory, timeout: float = 30):
     # task's own context (task-local — concurrent calls carrying different
     # scopes don't interfere). No-op when no override is active.
     coro = _wrap_with_home_override(coro)
-    # Same cross-thread propagation for the per-user Slack user ID. Without
-    # this, _current_slack_user_id set in on_processing_start (Slack thread)
-    # is never seen by get_tokens() (MCP loop thread), so the SDK always falls
-    # back to the shared SA token regardless of which user sent the message.
-    coro = _wrap_with_slack_user_id(coro)
 
     future = safe_schedule_threadsafe(
         coro, loop,

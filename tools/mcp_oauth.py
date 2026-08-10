@@ -108,11 +108,15 @@ _oauth_interactive_enabled: "contextvars.ContextVar[bool]" = contextvars.Context
 # Per-turn Slack user ID for per-user MCP token lookup.
 # Set by the Slack adapter's on_processing_start before each turn so that
 # HermesTokenStorage.get_tokens() can prefer a user-specific token file over
-# the shared service-account token.  ContextVar propagates across the
-# asyncio thread boundary (run_coroutine_threadsafe) — same reason as above.
-_current_slack_user_id: "contextvars.ContextVar[str | None]" = contextvars.ContextVar(
-    "_current_slack_user_id", default=None
-)
+# the shared service-account token.
+#
+# Plain module-level variable (NOT a ContextVar) because MCP tool calls run on
+# _mcp_loop — a daemon thread with its own event loop.  run_coroutine_threadsafe
+# copies the MCP loop thread's context, not the calling Slack thread's context,
+# so a ContextVar set in on_processing_start would always read as None inside
+# get_tokens().  A plain global is shared across all threads and visible
+# everywhere.  Sequential single-pod processing means no race condition.
+_current_slack_user_id: "str | None" = None
 
 # Skip tokens accepted at the paste prompt — exit OAuth without auth.
 _SKIP_TOKENS = frozenset({"skip", "cancel", "s", "n", "no", "q", "quit"})
@@ -283,7 +287,7 @@ class HermesTokenStorage:
         Path: HERMES_HOME/user-tokens/{slack_user_id}/{server_name}.json
         Written by the auth-ui pod after a successful PKCE flow.
         """
-        user_id = _current_slack_user_id.get()
+        user_id = _current_slack_user_id
         if not user_id:
             return None
         try:
@@ -301,7 +305,7 @@ class HermesTokenStorage:
             if data is not None:
                 logger.debug(
                     "MCP OAuth '%s': using per-user token for slack_user=%s",
-                    self._server_name, _current_slack_user_id.get(),
+                    self._server_name, _current_slack_user_id,
                 )
             # Fall through to SA token if the user file is unreadable.
         else:

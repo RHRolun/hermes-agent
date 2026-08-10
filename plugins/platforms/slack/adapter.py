@@ -1981,27 +1981,38 @@ class SlackAdapter(BasePlatformAdapter):
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an in-progress reaction when message processing begins."""
-        # Publish the Slack user ID so HermesTokenStorage.get_tokens() can
-        # pick up the per-user MCP token for this turn (see mcp_oauth.py).
-        user_id = getattr(event.source, "user_id", None)
-        if user_id:
-            try:
-                from tools.mcp_oauth import _current_slack_user_id
-                _current_slack_user_id.set(user_id)
-                # Force the MCP SDK to re-call get_tokens() on the next request
-                # so it picks up the per-user token rather than using its cached
-                # service-account token. Setting _initialized = False is the same
-                # operation that invalidate_if_disk_changed performs when it
-                # detects an external token refresh. Without this, the SDK keeps
-                # using the SA token it loaded at pod startup for the entire
-                # lifetime of the process, bypassing the ContextVar-based
-                # per-user token selection in HermesTokenStorage.get_tokens().
-                from tools.mcp_oauth_manager import get_manager
-                for _entry in get_manager()._entries.values():
-                    if _entry.provider is not None and hasattr(_entry.provider, "_initialized"):
-                        _entry.provider._initialized = False
-            except Exception:
-                pass
+        # Select the per-user MCP token for this turn (see mcp_oauth.py).
+        # We use a plain module-level variable (not a ContextVar) because MCP
+        # tool calls run on a daemon thread (_mcp_loop) whose context doesn't
+        # inherit from the Slack event handler — a global is visible everywhere.
+        #
+        # Always reset to None first so unlinked users never inherit the
+        # previous user's identity, then set if a user-specific token exists.
+        try:
+            import tools.mcp_oauth as _mcp_oauth
+            _mcp_oauth._current_slack_user_id = None
+
+            user_id = getattr(event.source, "user_id", None)
+            if user_id:
+                from pathlib import Path
+                try:
+                    from hermes_constants import get_hermes_home
+                    _hermes_home = Path(get_hermes_home())
+                except ImportError:
+                    _hermes_home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+                _user_token_path = _hermes_home / "user-tokens" / user_id / "gateway.json"
+                if _user_token_path.exists():
+                    _mcp_oauth._current_slack_user_id = user_id
+
+            # Force the MCP SDK to re-call get_tokens() on the next request so
+            # it picks up the correct token (user or SA) for this turn.
+            # _initialized = False is the same flag invalidate_if_disk_changed sets.
+            from tools.mcp_oauth_manager import get_manager
+            for _entry in get_manager()._entries.values():
+                if _entry.provider is not None and hasattr(_entry.provider, "_initialized"):
+                    _entry.provider._initialized = False
+        except Exception:
+            pass
 
         if not self._reactions_enabled():
             return
@@ -2016,6 +2027,13 @@ class SlackAdapter(BasePlatformAdapter):
         self, event: MessageEvent, outcome: ProcessingOutcome
     ) -> None:
         """Swap the in-progress reaction for a final success/failure reaction."""
+        # Clear per-user token context after the turn so the global doesn't
+        # linger and accidentally affect any background operations.
+        try:
+            import tools.mcp_oauth as _mcp_oauth
+            _mcp_oauth._current_slack_user_id = None
+        except Exception:
+            pass
         if not self._reactions_enabled():
             return
         ts = getattr(event, "message_id", None)
