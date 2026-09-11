@@ -777,6 +777,13 @@ class APIServerAdapter(BasePlatformAdapter):
             raw_port = os.getenv("API_SERVER_PORT", str(DEFAULT_PORT))
         self._port: int = _coerce_port(raw_port, DEFAULT_PORT)
         self._api_key: str = extra.get("key", os.getenv("API_SERVER_KEY", ""))
+        # Opt-in only: lets _check_auth trust an unauthenticated loopback peer
+        # (see there) instead of requiring the bearer token even from
+        # loopback. Off by default so a deployment that doesn't know about
+        # this stays exactly as secure as before it existed.
+        self._skip_auth: bool = extra.get(
+            "skip_auth", os.getenv("API_SERVER_SKIP_AUTH", "")
+        ) in (True, "true", "1", "yes")
         self._cors_origins: tuple[str, ...] = self._parse_cors_origins(
             extra.get("cors_origins", os.getenv("API_SERVER_CORS_ORIGINS", "")),
         )
@@ -972,14 +979,16 @@ class APIServerAdapter(BasePlatformAdapter):
             token = auth_header[7:].strip()
             if hmac.compare_digest(token, self._api_key):
                 return None  # Auth OK
-        elif not auth_header and request.remote in ("127.0.0.1", "::1"):
-            # OpenShell's service-relay strips Authorization unconditionally
-            # before forwarding into the sandbox's loopback — it enforces its
-            # own mTLS auth ahead of the tunnel instead. Trust that boundary
-            # for loopback-sourced requests with no credential, rather than
-            # making this endpoint unreachable through such an ingress. A
-            # non-loopback peer still always requires the bearer token.
-            return None  # Auth OK (trusted loopback ingress)
+        elif self._skip_auth and not auth_header and request.remote in ("127.0.0.1", "::1"):
+            # Opt-in (self._skip_auth, off by default — see __init__) escape
+            # hatch for deployments that put a real auth boundary in front of
+            # this process's loopback instead of relying on the bearer token
+            # here — e.g. OpenShell's service-relay, which strips
+            # Authorization unconditionally before forwarding into the
+            # sandbox's loopback and enforces its own mTLS auth ahead of the
+            # tunnel instead. A non-loopback peer still always requires the
+            # bearer token regardless of this setting.
+            return None  # Auth OK (trusted loopback ingress, skip_auth=true)
 
         logger.warning(
             "API server rejected invalid API key: %s",
