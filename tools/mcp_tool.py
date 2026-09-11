@@ -95,7 +95,7 @@ import sys
 import threading
 import time
 from typing import Callable
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Coroutine, Dict, List, Optional
 from urllib.parse import urlparse
 
@@ -1851,6 +1851,9 @@ class MCPServerTask:
             sampling_kwargs.update(self._elicitation.session_kwargs())
         if _MCP_NOTIFICATION_TYPES and _MCP_MESSAGE_HANDLER_SUPPORTED:
             sampling_kwargs["message_handler"] = self._make_message_handler()
+        # Without this, a dead transport leaves in-flight calls hanging on
+        # the outer tool_timeout instead of failing fast on their own.
+        sampling_kwargs["read_timeout_seconds"] = timedelta(seconds=self.tool_timeout)
 
         # Snapshot child PIDs before spawning so we can track the new one.
         pids_before = _snapshot_child_pids()
@@ -2058,6 +2061,9 @@ class MCPServerTask:
             sampling_kwargs.update(self._elicitation.session_kwargs())
         if _MCP_NOTIFICATION_TYPES and _MCP_MESSAGE_HANDLER_SUPPORTED:
             sampling_kwargs["message_handler"] = self._make_message_handler()
+        # Without this, a dead transport leaves in-flight calls hanging on
+        # the outer tool_timeout instead of failing fast on their own.
+        sampling_kwargs["read_timeout_seconds"] = timedelta(seconds=self.tool_timeout)
 
         # SSE transport (for MCP servers that implement the SSE transport protocol
         # rather than Streamable HTTP). Configure with ``transport: sse`` in the
