@@ -972,6 +972,14 @@ class APIServerAdapter(BasePlatformAdapter):
             token = auth_header[7:].strip()
             if hmac.compare_digest(token, self._api_key):
                 return None  # Auth OK
+        elif not auth_header and request.remote in ("127.0.0.1", "::1"):
+            # OpenShell's service-relay strips Authorization unconditionally
+            # before forwarding into the sandbox's loopback — it enforces its
+            # own mTLS auth ahead of the tunnel instead. Trust that boundary
+            # for loopback-sourced requests with no credential, rather than
+            # making this endpoint unreachable through such an ingress. A
+            # non-loopback peer still always requires the bearer token.
+            return None  # Auth OK (trusted loopback ingress)
 
         logger.warning(
             "API server rejected invalid API key: %s",
